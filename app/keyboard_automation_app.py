@@ -1,4 +1,4 @@
-"""Runtime application for recording custom hand gestures."""
+"""Runtime application for gesture-driven keyboard automation."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from app.threaded_video_pipeline import HandDetectorProtocol
 from app.threaded_video_pipeline import ProcessedFrame
 from app.threaded_video_pipeline import ThreadedHandDetectionPipeline
 from app.webcam_app import InputProvider
-from gestures.custom_gesture import CustomGestureStore
-from gestures.custom_gesture import REQUIRED_LANDMARKS
-from gestures.custom_gesture import LandmarkSample
-from vision.hand_detection import DetectedHand, HandDetectionError
+from services.keyboard_controller import KeyboardAutomationController
+from services.keyboard_controller import KeyboardControlError
+from services.keyboard_controller import KeyboardControlStatus
+from vision.hand_detection import HandDetectionError
 from vision.hand_detection import HandDetectionService
 from vision.webcam import CameraInfo, CameraService, WebcamError
 
@@ -22,31 +22,27 @@ from vision.webcam import CameraInfo, CameraService, WebcamError
 DetectorFactory = Callable[[], HandDetectorProtocol]
 
 
-class CustomGestureRecordingApplication:
-    """Record hand landmark samples and save them as a named gesture."""
+class KeyboardAutomationApplication:
+    """Coordinate webcam hand detection and keyboard automation."""
 
     def __init__(
         self,
         camera_service: CameraService | None = None,
         detector_factory: DetectorFactory | None = None,
-        gesture_store: CustomGestureStore | None = None,
+        keyboard_controller: KeyboardAutomationController | None = None,
         input_provider: InputProvider = input,
         cv2_module: Any | None = None,
     ) -> None:
         self._camera_service = camera_service or CameraService()
         self._detector_factory = detector_factory or HandDetectionService
-        self._gesture_store = gesture_store or CustomGestureStore()
+        self._keyboard_controller = (
+            keyboard_controller or KeyboardAutomationController()
+        )
         self._input_provider = input_provider
         self._cv2 = cv2_module or self._load_cv2()
 
-    def run(
-        self,
-        gesture_name: str,
-        camera_index: int | None,
-        max_cameras: int,
-        sample_count: int,
-    ) -> int:
-        """Select a camera and record a custom gesture."""
+    def run(self, camera_index: int | None, max_cameras: int) -> int:
+        """Discover cameras, select one, and start keyboard automation."""
         cameras = self._camera_service.detect_available_cameras(max_cameras)
         if not cameras:
             print("No available cameras were detected.")
@@ -57,35 +53,32 @@ class CustomGestureRecordingApplication:
         if selected_index is None:
             return 1
 
-        return self._record_gesture(
-            gesture_name=gesture_name,
-            camera_index=selected_index,
-            sample_count=max(1, sample_count),
-        )
+        return self._display_feed(selected_index)
 
-    def _record_gesture(
-        self,
-        gesture_name: str,
-        camera_index: int,
-        sample_count: int,
-    ) -> int:
-        samples: list[LandmarkSample] = []
-        samples_lock = Lock()
-        window_name = f"Record Gesture - {gesture_name}"
+    def _display_feed(self, camera_index: int) -> int:
+        window_name = f"Keyboard Automation - Camera {camera_index}"
+        status_lock = Lock()
+        latest_status = KeyboardControlStatus()
 
         def handle_inference(processed_frame: ProcessedFrame) -> bool:
-            with samples_lock:
-                self._collect_sample(processed_frame.detected_hands, samples)
-                return len(samples) >= sample_count
+            nonlocal latest_status
+
+            status = self._keyboard_controller.update(
+                processed_frame.detected_hands,
+                timestamp_ms=processed_frame.timestamp_ms,
+            )
+            with status_lock:
+                latest_status = status
+            return False
 
         def draw_overlay(
             frame: object,
             _processed_frame: ProcessedFrame,
-            _fps: float,
+            fps: float,
         ) -> None:
-            with samples_lock:
-                collected_samples = len(samples)
-            self._draw_progress(frame, collected_samples, sample_count)
+            with status_lock:
+                status = latest_status
+            self._draw_status(frame, status, fps)
 
         pipeline = ThreadedHandDetectionPipeline(
             capture_factory=lambda: self._camera_service.open_camera(
@@ -100,72 +93,43 @@ class CustomGestureRecordingApplication:
         )
 
         try:
-            print(
-                f"Hold '{gesture_name}' steady. "
-                f"Recording {sample_count} samples. Press Q to cancel."
-            )
-            pipeline.run()
-
-            with samples_lock:
-                collected_samples = tuple(samples)
-
-            if len(collected_samples) < sample_count:
-                print("Custom gesture recording cancelled.")
-                return 1
-
-            self._gesture_store.save_gesture(gesture_name, collected_samples)
-            print(
-                f"Saved custom gesture '{gesture_name}' to "
-                f"{self._gesture_store.path}."
-            )
-            return 0
-
-        except (HandDetectionError, WebcamError, ValueError) as exc:
+            print("Keyboard automation is active. Press Q to quit.")
+            return pipeline.run()
+        except (HandDetectionError, KeyboardControlError, WebcamError) as exc:
             print(str(exc))
             return 1
         except KeyboardInterrupt:
-            print("Custom gesture recording interrupted.")
-            return 1
+            print("Keyboard automation interrupted.")
+            return 0
         except Exception as exc:
-            print(f"Custom gesture recording stopped unexpectedly: {exc}")
+            print(f"Keyboard automation stopped unexpectedly: {exc}")
             return 1
 
-    def _collect_sample(
-        self,
-        detected_hands: Sequence[DetectedHand],
-        samples: list[LandmarkSample],
-    ) -> None:
-        if not detected_hands:
-            return
-
-        landmarks = detected_hands[0].landmarks
-        if len(landmarks) >= REQUIRED_LANDMARKS:
-            samples.append(landmarks)
-
-    def _draw_progress(
+    def _draw_status(
         self,
         frame: object,
-        collected_samples: int,
-        sample_count: int,
+        status: KeyboardControlStatus,
+        fps: float,
     ) -> None:
-        label = f"Recording: {collected_samples}/{sample_count}"
-        self._cv2.putText(
-            frame,
-            label,
-            (12, 32),
-            self._cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2,
-            self._cv2.LINE_AA,
+        fps_label = f"FPS: {fps:.1f}" if fps > 0 else "FPS: --"
+        keys_label = "+".join(status.keys) if status.keys else "None"
+        lines = (
+            f"Keyboard: {status.action}",
+            f"Gesture: {status.gesture}",
+            f"Keys: {keys_label}",
+            fps_label,
         )
-
-    def _flip_frame(self, frame: object) -> object:
-        try:
-            self._cv2.flip(frame, 1, frame)
-            return frame
-        except Exception:
-            return self._cv2.flip(frame, 1)
+        for index, line in enumerate(lines):
+            self._cv2.putText(
+                frame,
+                line,
+                (12, 32 + index * 24),
+                self._cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                self._cv2.LINE_AA,
+            )
 
     def _select_camera(
         self,
@@ -212,26 +176,28 @@ class CustomGestureRecordingApplication:
                 f"{camera.name} ({size}, reported FPS {fps})"
             )
 
+    def _flip_frame(self, frame: object) -> object:
+        try:
+            self._cv2.flip(frame, 1, frame)
+            return frame
+        except Exception:
+            return self._cv2.flip(frame, 1)
+
     @staticmethod
     def _load_cv2() -> Any:
         try:
             return importlib.import_module("cv2")
         except ImportError as exc:
             raise WebcamError(
-                "OpenCV is required for custom gesture recording. "
+                "OpenCV is required for keyboard automation. "
                 "Install it with: pip install opencv-python"
             ) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the custom gesture recording parser."""
+    """Build the keyboard automation command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Record a named custom gesture from hand landmarks.",
-    )
-    parser.add_argument(
-        "--name",
-        required=True,
-        help="Name for the custom gesture.",
+        description="Trigger keyboard shortcuts with recognized hand gestures.",
     )
     parser.add_argument(
         "--camera",
@@ -245,29 +211,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of camera indexes to scan, starting at 0.",
     )
-    parser.add_argument(
-        "--samples",
-        type=int,
-        default=30,
-        help="Number of detected landmark samples to save.",
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run custom gesture recording."""
+    """Run gesture-driven keyboard automation."""
     parser = build_parser()
     args = parser.parse_args(argv)
 
     try:
-        app = CustomGestureRecordingApplication()
-        return app.run(
-            gesture_name=args.name,
-            camera_index=args.camera,
-            max_cameras=args.max_cameras,
-            sample_count=args.samples,
-        )
-    except (HandDetectionError, WebcamError) as exc:
+        app = KeyboardAutomationApplication()
+        return app.run(camera_index=args.camera, max_cameras=args.max_cameras)
+    except (HandDetectionError, KeyboardControlError, WebcamError) as exc:
         print(str(exc))
         return 1
 

@@ -4,22 +4,15 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Sequence
 
-from app.webcam_app import FpsCounter, InputProvider
-from vision.hand_detection import DetectedHand, HandDetectionError
+from app.threaded_video_pipeline import HandDetectorProtocol
+from app.threaded_video_pipeline import ProcessedFrame
+from app.threaded_video_pipeline import ThreadedHandDetectionPipeline
+from app.webcam_app import InputProvider
+from vision.hand_detection import HandDetectionError
 from vision.hand_detection import HandDetectionService
 from vision.webcam import CameraInfo, CameraService, WebcamError
-
-
-class HandDetectorProtocol(Protocol):
-    """Subset of the hand detector API used by the application loop."""
-
-    def detect_and_draw(self, frame: object) -> list[DetectedHand]:
-        """Draw hand annotations and return detected hand metadata."""
-
-    def close(self) -> None:
-        """Release detector resources."""
 
 
 DetectorFactory = Callable[[], HandDetectorProtocol]
@@ -83,35 +76,21 @@ class HandDetectionApplication:
             print(f"Camera {selected_index} is not available.")
 
     def _display_feed(self, camera_index: int) -> int:
-        capture = None
-        detector: HandDetectorProtocol | None = None
         window_name = f"Hand Detection - Camera {camera_index}"
-        fps_counter = FpsCounter()
+        pipeline = ThreadedHandDetectionPipeline(
+            capture_factory=lambda: self._camera_service.open_camera(
+                camera_index,
+            ),
+            detector_factory=self._detector_factory,
+            cv2_module=self._cv2,
+            window_name=window_name,
+            frame_transform=self._flip_frame,
+            draw_overlay=self._draw_pipeline_overlay,
+        )
 
         try:
-            detector = self._detector_factory()
-            capture = self._camera_service.open_camera(camera_index)
             print("Press Q to quit the hand detection preview.")
-
-            while True:
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    print(
-                        "Camera feed stopped. "
-                        "The camera may have disconnected."
-                    )
-                    return 1
-
-                frame = self._cv2.flip(frame, 1)
-                detector.detect_and_draw(frame)
-                fps = fps_counter.update()
-                self._draw_fps(frame, fps)
-                self._cv2.imshow(window_name, frame)
-
-                key = self._cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    return 0
-
+            return pipeline.run()
         except (HandDetectionError, WebcamError) as exc:
             print(str(exc))
             return 1
@@ -121,12 +100,6 @@ class HandDetectionApplication:
         except Exception as exc:
             print(f"Hand detection preview stopped unexpectedly: {exc}")
             return 1
-        finally:
-            if detector is not None:
-                detector.close()
-            if capture is not None:
-                capture.release()
-            self._cv2.destroyAllWindows()
 
     def _draw_fps(self, frame: object, fps: float) -> None:
         label = f"FPS: {fps:.1f}" if fps > 0 else "FPS: --"
@@ -140,6 +113,21 @@ class HandDetectionApplication:
             2,
             self._cv2.LINE_AA,
         )
+
+    def _draw_pipeline_overlay(
+        self,
+        frame: object,
+        _processed_frame: ProcessedFrame,
+        fps: float,
+    ) -> None:
+        self._draw_fps(frame, fps)
+
+    def _flip_frame(self, frame: object) -> object:
+        try:
+            self._cv2.flip(frame, 1, frame)
+            return frame
+        except Exception:
+            return self._cv2.flip(frame, 1)
 
     @staticmethod
     def _print_cameras(cameras: Sequence[CameraInfo]) -> None:

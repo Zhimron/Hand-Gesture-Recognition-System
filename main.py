@@ -22,6 +22,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return custom_gesture_main(args[1:])
 
+    if args and args[0] in {"mouse", "mouse-control", "control-mouse"}:
+        from app.mouse_control_app import main as mouse_control_main
+
+        return mouse_control_main(args[1:])
+
+    if args and args[0] in {"keyboard", "keyboard-control", "keyboard-automation"}:
+        from app.keyboard_automation_app import main as keyboard_main
+
+        return keyboard_main(args[1:])
+
+    if args and args[0] in {"keyboard-map", "keyboard-mapping"}:
+        from app.keyboard_mapping_app import main as keyboard_mapping_main
+
+        return keyboard_mapping_main(args[1:])
+
+    if args and args[0] in {"desktop", "gui", "interface"}:
+        from app.desktop_app import main as desktop_main
+
+        return desktop_main(args[1:])
+
     if args and args[0] == "webcam":
         return webcam_main(args[1:])
 
